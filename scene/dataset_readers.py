@@ -23,6 +23,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 import torch
+from utils.camera_utils import camera_nerfies_from_JSON
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -48,7 +49,30 @@ class SceneInfo(NamedTuple):
     ply_path: str
     semantic_feature_dim: int 
 
-def getNerfppNorm(cam_info):
+# def getNerfppNorm(cam_info):
+#     def get_center_and_diag(cam_centers):
+#         cam_centers = np.hstack(cam_centers)
+#         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
+#         center = avg_cam_center
+#         dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
+#         diagonal = np.max(dist)
+#         return center.flatten(), diagonal
+
+#     cam_centers = []
+
+#     for cam in cam_info:
+#         W2C = getWorld2View2(cam.R, cam.T)
+#         C2W = np.linalg.inv(W2C)
+#         cam_centers.append(C2W[:3, 3:4])
+
+#     center, diagonal = get_center_and_diag(cam_centers)
+#     radius = diagonal * 1.1
+
+#     translate = -center
+
+#     return {"translate": translate, "radius": radius}
+
+def getNerfppNorm(cam_info, apply=False):
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
@@ -56,21 +80,34 @@ def getNerfppNorm(cam_info):
         dist = np.linalg.norm(cam_centers - center, axis=0, keepdims=True)
         diagonal = np.max(dist)
         return center.flatten(), diagonal
-
     cam_centers = []
-
+    if apply:
+        c2ws = []
     for cam in cam_info:
         W2C = getWorld2View2(cam.R, cam.T)
         C2W = np.linalg.inv(W2C)
+        if apply:
+            c2ws.append(C2W)
         cam_centers.append(C2W[:3, 3:4])
-
     center, diagonal = get_center_and_diag(cam_centers)
-    radius = diagonal * 1.1
-
+    radius = diagonal
     translate = -center
-
-    return {"translate": translate, "radius": radius}
-
+    if apply:
+        c2ws = np.stack(c2ws, axis=0)
+        c2ws[:, :3, -1] += translate
+        c2ws[:, :3, -1] /= radius
+        w2cs = np.linalg.inv(c2ws)
+        for i in range(len(cam_info)):
+            cam = cam_info[i]
+            cam_info[i] = cam._replace(R=w2cs[i, :3, :3].T, T=w2cs[i, :3, 3])
+        apply_translate = translate
+        apply_radius = radius
+        translate = 0
+        radius = 1.
+        return {"translate": translate, "radius": radius, "apply_translate": apply_translate, "apply_radius": apply_radius}
+    else:
+        return {"translate": translate, "radius": radius}
+    
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, semantic_feature_folder):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -296,7 +333,251 @@ def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extens
                            semantic_feature_dim=semantic_feature_dim) 
     return scene_info
 
+def readNerfiesColmapCameras(path):
+    with open(f'{path}/metadata.json', 'r') as f:
+        meta_json = json.load(f)
+    with open(f'{path}/dataset.json', 'r') as f:
+        dataset_json = json.load(f)
+
+    name = path.split('/')[-2]
+    if name.startswith('vrig'):
+        train_img = dataset_json['train_ids']
+        val_img = dataset_json['val_ids']
+        all_img = train_img + val_img
+        ratio = 0.25
+    elif name.startswith('NeRF'):
+        train_img = dataset_json['train_ids']
+        val_img = dataset_json['val_ids']
+        all_img = train_img + val_img
+        ratio = 1.0
+    elif name.startswith('interp'):
+        all_id = dataset_json['ids']
+        train_img = all_id[::4]
+        val_img = all_id[2::4]
+        all_img = train_img + val_img
+        ratio = 0.5
+    else:  # for hypernerf
+        train_img = dataset_json['ids'][::4]
+        all_img = train_img
+        ratio = 0.5
+        # ratio = 1
+
+    train_num = len(train_img)
+
+    all_cam = [meta_json[i]['camera_id'] for i in all_img]
+    all_time = [meta_json[i]['time_id'] for i in all_img]
+    max_time = max(all_time)
+    all_time = [meta_json[i]['time_id'] / max_time for i in all_img]
+    selected_time = set(all_time)
+    
+    sparse_name = "sparse" if os.path.exists(os.path.join(path, 'colmap', "sparse")) else "colmap_sparse"
+    cameras_extrinsic_file = os.path.join(path, 'colmap', f"{sparse_name}/0", "images.bin")
+    cameras_intrinsic_file = os.path.join(path, 'colmap', f"{sparse_name}/0", "cameras.bin")
+    cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+    cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    
+    # if os.path.exists(f'{path}/rgb/rgba'):
+    #     img_path = f'{path}/rgb/rgba'
+    #     msk_path = None
+    # else:
+    #     img_path = f'{path}/rgb/{int(1 / ratio)}x/'
+    #     msk_path = f'{path}/resized_mask/{int(1 / ratio)}x/'
+    #     msk_path = msk_path if os.path.exists(msk_path) else None
+    img_path = f'{path}/rgb/{int(1 / ratio)}x/'
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=img_path, source_path=path)
+    name2idx = {cam.image_name: idx for idx, cam in enumerate(cam_infos_unsorted)}
+
+    cam_infos = []
+    for idx in range(len(all_img)):
+        cam_infos.append(cam_infos_unsorted[name2idx[all_img[idx]]])
+        cam_infos[-1]._replace(fid=all_time[idx])
+    return cam_infos, train_num, 0, 1
+
+def readNerfiesCameras(path, objects_folder=None, is_testing=False):
+    with open(f'{path}/scene.json', 'r') as f:
+        scene_json = json.load(f)
+    with open(f'{path}/metadata.json', 'r') as f:
+        meta_json = json.load(f)
+    with open(f'{path}/dataset.json', 'r') as f:
+        dataset_json = json.load(f)
+
+    coord_scale = scene_json['scale']
+    scene_center = scene_json['center']
+
+    name = path.split('/')[-2]
+    if name.startswith('vrig'):
+        print("vrig dataset")
+        train_img = dataset_json['train_ids']
+        val_img = dataset_json['val_ids']
+        all_img = train_img + val_img
+        ratio = 0.25
+    elif name.startswith('NeRF'):
+        print("It's NeRF-DS dataset")
+        train_img = dataset_json['train_ids']
+        val_img = dataset_json['val_ids']
+        all_img = train_img + val_img
+        ratio = 0.5
+    elif name.startswith('interp'):
+        all_id = dataset_json['ids']
+        train_img = all_id[::4]
+        val_img = all_id[2::4]
+        all_img = train_img + val_img
+        ratio = 0.5
+    else:  # for hypernerf
+        # train_img = dataset_json['ids'][::4]
+        # all_img = train_img
+        # ratio = 0.5
+        print("It's HyperNeRF misc dataset")
+        all_id = dataset_json['ids']
+        train_img = all_id[::4]
+        val_img = all_id[2::4]
+        all_img = train_img + val_img
+        ratio = 0.5
+
+    train_num = len(train_img)
+
+    all_cam = [meta_json[i]['camera_id'] for i in all_img]
+    all_time = [meta_json[i]['time_id'] for i in all_img]
+    max_time = max(all_time)
+    all_time = [meta_json[i]['time_id'] / max_time for i in all_img]
+    selected_time = set(all_time)
+
+    # all poses
+    all_cam_params = []
+    for im in all_img:
+        camera = camera_nerfies_from_JSON(f'{path}/camera/{im}.json', ratio)
+        camera['position'] = camera['position'] - scene_center
+        camera['position'] = camera['position'] * coord_scale
+        all_cam_params.append(camera)
+
+    all_img = [f'{path}/rgb/{int(1 / ratio)}x/{i}.png' for i in all_img]
+
+    cam_infos = []
+    if is_testing:
+        print("Testing mode enable. SAM features and masks are not loaded...")
+    for idx in range(len(all_img)):
+        image_path = all_img[idx]
+        image = np.array(Image.open(image_path))
+        image = Image.fromarray((image).astype(np.uint8))
+        image_name = Path(image_path).stem
+
+        object_path = os.path.join(path, 'object_mask', image_name + '.png')
+        # features_path = os.path.join(path, 'features_16', image_name + '.pt')
+        masks_path = os.path.join(path, 'masks', image_name + '.pt')
+        if not is_testing:
+            # features = torch.load(features_path).to('cpu')
+            masks = torch.load(masks_path).to('cpu') if os.path.exists(masks_path) else None
+            objects = torch.from_numpy(np.array(Image.open(object_path))).to('cpu') if os.path.exists(object_path) else None
+        else:
+            # features = None
+            objects = None 
+            masks = None
+        
+        orientation = all_cam_params[idx]['orientation'].T
+        position = -all_cam_params[idx]['position'] @ orientation
+        focal = all_cam_params[idx]['focal_length']
+        fid = all_time[idx]
+        T = position
+        R = orientation
+
+        FovY = focal2fov(focal, image.size[1])
+        FovX = focal2fov(focal, image.size[0])
+        
+        cam_info = CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=image_path, image_name=image_name, width=image.size[
+                                  0], height=image.size[1],
+                              fid=fid, masks=masks, mask_path=masks_path, objects=objects)
+        cam_infos.append(cam_info)
+
+    sys.stdout.write('\n')
+    return cam_infos, train_num, scene_center, coord_scale
+def translate_cam_info(cam_info, translate):
+    for i in range(len(cam_info)):
+        cam = cam_info[i]
+        W2C = getWorld2View2(cam.R, cam.T)
+        C2W = np.linalg.inv(W2C)
+        C2W[:3, 3] += translate
+        W2C = np.linalg.inv(C2W)
+        cam_info[i] = cam._replace(R=W2C[:3, :3].T, T=W2C[:3, 3])
+def readNerfiesInfo(path, eval, object_path, is_testing=False):
+    print("Reading Nerfies Info")
+    # cam_infos, train_num, scene_center, scene_scale = readNerfiesCameras(path, objects_folder=None)
+    if os.path.exists(os.path.join(path, 'colmap')):
+        cam_infos, train_num, scene_center, scene_center = readNerfiesColmapCameras(path)
+        recenter_by_pcl = apply_cam_norm = True
+    else:
+        cam_infos, train_num, scene_center, scene_scale = readNerfiesCameras(path, is_testing=is_testing)
+        recenter_by_pcl = apply_cam_norm = False
+        
+    if eval:
+        train_cam_infos = cam_infos[:train_num]
+        test_cam_infos = cam_infos[train_num:]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    # nerf_normalization = getNerfppNorm(train_cam_infos)
+    nerf_normalization = getNerfppNorm(train_cam_infos, apply=apply_cam_norm)
+    
+    if os.path.exists(os.path.join(path, 'colmap')):
+        print('Using COLMAP for Nerfies!')
+        sparse_name = "sparse" if os.path.exists(os.path.join(path, 'colmap', "sparse")) else "colmap_sparse"
+        if recenter_by_pcl:
+            ply_path = os.path.join(path, f"colmap/{sparse_name}/0/points3d_recentered.ply")
+        elif apply_cam_norm:
+            ply_path = os.path.join(path, f"colmap/{sparse_name}/0/points3d_normalized.ply")
+        else:
+            ply_path = os.path.join(path, f"colmap/{sparse_name}/0/points3d.ply")
+        bin_path = os.path.join(path, f"colmap/{sparse_name}/0/points3D.bin")
+        txt_path = os.path.join(path, f"colmap/{sparse_name}/0/points3D.txt")
+        adj_path = os.path.join(path, f"colmap/{sparse_name}/0/camera_adjustment")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            if apply_cam_norm:
+                xyz += nerf_normalization["apply_translate"]
+                xyz /= nerf_normalization["apply_radius"]
+            if recenter_by_pcl:
+                pcl_center = xyz.mean(axis=0)
+                translate_cam_info(train_cam_infos, - pcl_center)
+                translate_cam_info(test_cam_infos, - pcl_center)
+                xyz -= pcl_center
+                np.savez(adj_path, translate=-pcl_center)
+            storePly(ply_path, xyz, rgb)
+        else:
+            translate = np.load(adj_path + '.npz')['translate']
+            translate_cam_info(train_cam_infos, translate=translate)
+            translate_cam_info(test_cam_infos, translate=translate)
+    else:
+        ply_path = os.path.join(path, "points3d.ply")
+        if not os.path.exists(ply_path):
+            print(f"Generating point cloud from nerfies...")
+
+            xyz = np.load(os.path.join(path, "points.npy"))
+            xyz = (xyz - scene_center) * scene_scale
+            num_pts = xyz.shape[0]
+            shs = np.random.random((num_pts, 3)) / 255.0
+            pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
+                shs), normals=np.zeros((num_pts, 3)))
+
+            storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "nerfies": readNerfiesInfo,
 }
